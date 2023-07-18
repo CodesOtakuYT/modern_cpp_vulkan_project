@@ -1,10 +1,16 @@
 #include <SDL.h>
 #include <SDL_vulkan.h>
 #include <stdexcept>
+#include <SDL_platform_defines.h>
 
 #define VULKAN_HPP_ENABLE_DYNAMIC_LOADER_TOOL 0
 
+#ifdef __WINDOWS__
+#define VK_USE_PLATFORM_WIN32_KHR
+#endif
+
 #include <vulkan/vulkan_raii.hpp>
+#include <SDL_syswm.h>
 
 class Noncopyable {
 public:
@@ -15,7 +21,7 @@ public:
     const Noncopyable &operator=(const Noncopyable &) = delete;
 };
 
-class SDLException : private std::runtime_error, Noncopyable {
+class SDLException : private std::runtime_error {
     const int code;
 public:
     explicit SDLException(const char *message, const int code = 0) : runtime_error(message), code{code} {}
@@ -93,6 +99,23 @@ public:
         return vk::raii::SurfaceKHR{instance, surface_handle};
     }
 
+    [[nodiscard]] auto get_physical_device_presentation_support(const vk::raii::PhysicalDevice &physical_device,
+                                                                uint32_t queue_family_index) const {
+        SDL_SysWMinfo info;
+        if (const auto return_code = SDL_GetWindowWMInfo(handle, &info, SDL_SYSWM_CURRENT_VERSION))
+            throw SDLException{SDL_GetError(), return_code};
+        switch (info.subsystem) {
+            case SDL_SYSWM_TYPE::SDL_SYSWM_WINDOWS:
+                return static_cast<bool>(physical_device.getDispatcher()->vkGetPhysicalDeviceWin32PresentationSupportKHR(
+                        *physical_device,
+                        queue_family_index));
+            default:
+                SDL_LogWarn(SDL_LogCategory::SDL_LOG_CATEGORY_APPLICATION,
+                            "Physical device presentation support for the current platform is not implemented, returning true anyway");
+                return true;
+        }
+    }
+
     [[nodiscard]] auto get_handle() const noexcept {
         return handle;
     }
@@ -125,18 +148,29 @@ auto main(int argc, char **argv) -> int {
     std::optional<QueueFamily> queue_family{};
     for (const auto &physical_device: instance.enumeratePhysicalDevices()) {
         const auto queue_families_properties = physical_device.getQueueFamilyProperties();
-        for (std::size_t queue_family_index = 0;
+        for (std::size_t queue_family_index{};
              queue_family_index != queue_families_properties.size(); ++queue_family_index) {
-            const auto queue_family_properties = queue_families_properties[queue_family_index];
+            const auto queue_family_properties{queue_families_properties[queue_family_index]};
+            const auto does_support_graphics{queue_family_properties.queueFlags & vk::QueueFlagBits::eGraphics};
+            const auto does_support_presentation{
+                    window.get_physical_device_presentation_support(physical_device, queue_family_index)};
 
-            if (queue_family_properties.queueFlags & vk::QueueFlagBits::eGraphics)
+            if (does_support_graphics && does_support_presentation)
                 queue_family = {physical_device, queue_family_index};
         }
     }
-    if (queue_family.has_value()) {
-        const auto &[physical_device, queue_family_index] = *queue_family;
-        SDL_Log("Found queue family: %s %d", physical_device.getProperties().deviceName.data(), queue_family_index);
-    }
+
+    if (!queue_family.has_value()) throw std::runtime_error("Couldn't find a suitable queue family");
+    const auto &[physical_device, queue_family_index] = *queue_family;
+    vk::DeviceCreateInfo info{};
+    vk::DeviceQueueCreateInfo queue_create_infos{};
+    const auto queue_priorities{0.0f};
+    queue_create_infos.setQueuePriorities(queue_priorities);
+    queue_create_infos.queueFamilyIndex = queue_family_index;
+    info.setQueueCreateInfos(queue_create_infos);
+
+    const vk::raii::Device device{physical_device, info};
+    const vk::raii::Queue queue{device, queue_family_index, 0};
 
     bool should_close{};
     while (!should_close) {
